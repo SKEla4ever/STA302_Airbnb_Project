@@ -1,0 +1,157 @@
+---
+output: html_document
+---
+
+```{r data-and-model}
+# Knit with the 20 original CSVs in data/raw/ next to this file.
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo"), fig.retina = 1)
+options(contrasts = c("contr.treatment", "contr.poly"))
+
+files <- sort(list.files("data/raw", pattern = "\\.csv$", full.names = TRUE))
+stopifnot(length(files) == 20L)
+
+read_offer_file <- function(path) {
+  offers <- read.csv(path, check.names = FALSE, stringsAsFactors = FALSE,
+                     na.strings = c("", "NA", "NaN", "null", "None"))
+  names(offers)[1] <- "source_row_index"
+  offers$city <- sub("_.*$", "", basename(path))
+  offers$day_type <- sub("^.*_(weekdays|weekends)\\.csv$", "\\1", basename(path))
+  offers$source_file <- basename(path)
+  offers
+}
+
+raw <- do.call(rbind, lapply(files, read_offer_file))
+rooms <- c("Private room", "Entire home/apt")
+dat <- raw[raw$room_type %in% rooms, ]
+rownames(dat) <- NULL
+dat$analysis_row <- seq_len(nrow(dat))
+
+cities <- sort(unique(dat$city))
+dat$host_portfolio <- factor(ifelse(dat$biz == 1, "5+ offers",
+  ifelse(dat$multi == 1, "2-4 offers", "Single offer")),
+  levels = c("Single offer", "2-4 offers", "5+ offers"))
+superhost <- tolower(trimws(as.character(dat$host_is_superhost))) == "true"
+dat$host_is_superhost <- factor(ifelse(superhost, "Superhost", "Non-Superhost"),
+                                levels = c("Non-Superhost", "Superhost"))
+dat$city <- factor(dat$city, levels = cities)
+dat$day_type <- factor(dat$day_type, levels = c("weekdays", "weekends"))
+dat$room_type <- factor(dat$room_type, levels = rooms)
+stopifnot(nrow(raw) == 51707L, nrow(dat) == 51341L, length(cities) == 10L)
+
+dir.create("data/processed", showWarnings = FALSE)
+write.csv(dat, "data/processed/part1_offers.csv", row.names = FALSE)
+c(imported = nrow(raw), excluded = nrow(raw) - nrow(dat), retained = nrow(dat))
+
+numeric_vars <- c("realSum", "person_capacity", "bedrooms", "cleanliness_rating",
+                  "guest_satisfaction_overall", "dist", "metro_dist", "attr_index_norm")
+factor_vars <- c("city", "day_type", "room_type", "host_is_superhost", "host_portfolio")
+round(t(sapply(dat[numeric_vars], function(x) {
+  c(Mean = mean(x), SD = sd(x), Min = min(x), Median = median(x), Max = max(x))
+})), 2)
+lapply(dat[factor_vars], function(x) round(100 * prop.table(table(x)), 2))
+
+fit <- lm(realSum ~ city * day_type + city * room_type + day_type * room_type +
+            person_capacity + bedrooms + cleanliness_rating +
+            guest_satisfaction_overall + host_is_superhost +
+            dist + metro_dist + attr_index_norm + host_portfolio,
+          data = dat, na.action = na.fail)
+stopifnot(fit$rank == 41L)
+summary(fit)
+confint(fit, "day_typeweekends:room_typeEntire home/apt")
+
+fv <- fitted(fit)
+res <- residuals(fit)
+rstd <- rstandard(fit)
+c(negative_fitted_prices = sum(fv < 0))
+
+bins <- cut(rank(fv, ties.method = "first"),
+            breaks = seq(0, length(fv), length.out = 26),
+            include.lowest = TRUE, labels = FALSE)
+fitted_means <- tapply(fv, bins, mean)
+blue <- "#256B82"
+orange <- "#B74226"
+```
+
+```{r observed-vs-fitted, fig.width=4.9, fig.height=4.9, dpi=200}
+par(mar = c(4.2, 4.3, 2.5, .9), mgp = c(2.6, .75, 0), pty = "s")
+plot(fv, dat$realSum, xlim = c(0, 900), ylim = c(0, 900), asp = 1,
+     xaxs = "i", yaxs = "i", pch = 16, cex = .35,
+     col = adjustcolor(blue, alpha.f = .17),
+     xlab = "Fitted price (EUR)", ylab = "Observed price (EUR)",
+     main = "Observed versus fitted price")
+abline(0, 1, lty = 2, lwd = 1.6, col = "gray35")
+lines(fitted_means, tapply(dat$realSum, bins, mean), col = orange, lwd = 2.3)
+legend("topleft", c("Binned means", "Observed = fitted"),
+       col = c(orange, "gray35"), lty = c(1, 2), lwd = c(2.3, 1.6),
+       inset = .025, bg = "white", box.col = "gray80", cex = .78)
+```
+
+```{r predictor-pairs, fig.width=9.7, fig.height=9.7, dpi=180}
+pairs(dat[numeric_vars[-1]],
+      labels = c("Capacity", "Bedrooms", "Cleanliness", "Guest\nsatisfaction",
+                 "Centre\ndistance", "Metro\ndistance", "Attraction\nindex"),
+      gap = .55, cex.labels = 1, font.labels = 2, cex.axis = .72,
+      lower.panel = function(x, y, ...) {
+        panel.smooth(x, y, pch = 16, cex = .22, col = adjustcolor(blue, alpha.f = .18),
+                     col.smooth = orange, span = .5, iter = 0, lwd = 1.7)
+      },
+      upper.panel = function(x, y, ...) {
+        old <- par(usr = c(0, 1, 0, 1))
+        on.exit(par(old))
+        text(.5, .5, sprintf("%.2f", round(cor(x, y), 2) + 0),
+             col = "#22576A", cex = 1.1)
+      })
+```
+
+```{r residual-diagnostics, fig.width=9.8, fig.height=4.25, dpi=180}
+par(mfrow = c(1, 2), mar = c(4.2, 4.6, 2.6, .9), mgp = c(2.8, .8, 0),
+    las = 1, cex = .9)
+central <- c(.005, .995)
+point_color <- adjustcolor(blue, alpha.f = .2)
+plot(fv, res, pch = 16, cex = .37, col = point_color, main = "Residuals vs fitted",
+     xlab = "Fitted price (EUR)", ylab = "Residual (EUR)",
+     xlim = quantile(fv, central), ylim = quantile(res, central),
+     xaxs = "i", yaxs = "i")
+abline(h = 0, lty = 2, lwd = 1.4, col = "gray40")
+lines(fitted_means, tapply(res, bins, mean), col = orange, lwd = 2)
+qqnorm(rstd, pch = 16, cex = .42, col = point_color, main = "Normal Q-Q",
+       xlab = "Theoretical normal quantile", ylab = "Standardized residual")
+qqline(rstd, col = orange, lwd = 2)
+```
+
+```{r spatial-residuals, fig.width=11, fig.height=12, dpi=160}
+# City-centred kilometre offsets for aggregated residuals.
+spatial_cells <- do.call(rbind, lapply(cities, function(city) {
+  i <- which(dat$city == city)
+  lng <- dat$lng[i]
+  lat <- dat$lat[i]
+  x <- floor((lng - mean(lng)) * 111.32 * cos(mean(lat) * pi / 180))
+  y <- floor((lat - mean(lat)) * 111.32)
+  cells <- split(seq_along(i), paste(x, y, sep = "|"))
+  do.call(rbind, lapply(cells, function(j) {
+    data.frame(city = city, x_km = x[j[1]] + .5, y_km = y[j[1]] + .5,
+               n = length(j), mean_residual = mean(res[i[j]]))
+  }))
+}))
+spatial_cells <- spatial_cells[spatial_cells$n >= 5, ]
+limit <- unname(quantile(abs(spatial_cells$mean_residual), .95))
+palette <- colorRampPalette(c("#256B92", "#F6F3E9", "#BC442C"))(101)
+
+par(mfrow = c(5, 2), mar = c(2.3, 3, 2.1, .7), oma = c(2, 2, 2.5, 0),
+    mgp = c(2, .6, 0), cex = .8)
+for (city in cities) {
+  cells <- spatial_cells[spatial_cells$city == city, ]
+  color_id <- pmax(1, pmin(101, round(51 + 50 * cells$mean_residual / limit)))
+  plot(cells$x_km, cells$y_km, type = "n", asp = 1,
+       xlim = range(cells$x_km) + c(-.5, .5), ylim = range(cells$y_km) + c(-.5, .5),
+       xlab = "", ylab = "", main = tools::toTitleCase(city))
+  rect(cells$x_km - .48, cells$y_km - .48, cells$x_km + .48, cells$y_km + .48,
+       col = palette[color_id], border = NA)
+}
+limit_label <- formatC(limit, digits = 0, format = "f", big.mark = ",")
+mtext(paste0("Cell mean residual: blue <= -", limit_label,
+             " EUR   |   white = 0   |   red >= ", limit_label, " EUR"),
+      outer = TRUE, side = 3, line = .6, cex = .85)
+mtext("East-west offset (km)", outer = TRUE, side = 1, line = .6, cex = .85)
+mtext("North-south offset (km)", outer = TRUE, side = 2, line = .6, cex = .85)
+```
